@@ -1,0 +1,939 @@
+#!/usr/local/bin/perl
+
+################################################################################
+#
+# mvparc [option] (See usage below)
+#
+#  Author:     Jason Frinchaboy
+#
+#  Revisions:  Date        Version   Notes
+#              07-01-09         .1   Created.
+#              07-07-09         .2   Now serves and saves error file.
+#
+################################################################################
+
+# Location for .pid files.
+my $piddir = "/opt/mvp";
+
+use File::Copy;
+use Sys::Hostname;
+use Net::Ping;
+use Switch;
+use Digest::MD5 qw(md5 md5_hex md5_base64);
+
+my $debug = 1;
+my $FORCE_CONFIG = 0;
+my $simulate = 1;
+
+sub usage
+{
+   print "\nUsage: (as superuser)  mvparc [option]
+
+--server            Setup machine as an archive server.
+
+--ai-image          Setup AutoInspector to save images to remote server.
+
+--ai-error          Setup AutoInspector to save error files to remote server.
+
+--ai-dbase          Setup AutoInspector to save recipe files to remote server.
+
+--at-image          Setup AutoTrainer to be client for saved images.
+
+--save-image        Save new local images to the remote server.
+
+--save-error        Save new local error files to the remote server.
+
+--save-dbase        Save all local databases (recipe files) to remote server.
+
+--delete-setup      Setup delete schedule.
+
+--delete            Perform delete action (defaults in simulate mode. add --nosim to commit).
+                    Needs -d days to keep.
+";
+
+   exit;
+}
+
+# Get command line and environment args.
+my $arg = shift;
+defined $arg or usage();
+
+# $PCB setup.
+my $pcb = $ENV{'PCB'};
+if ( ! defined $pcb ) {
+    msg("PCB was not set so defaulting to /opt/mvp");
+    $pcb = "/opt/mvp";
+}
+
+my $logfile = "$pcb/elog/mvparc.log";
+
+# Root node of error file server.
+my $error_arc_dir = "/opt/mvp/error";
+my $image_arc_dir = "/opt/mvp/image";
+
+# Mount point to $img_arc_dir on AutoTrainer.
+# $img_arc_dir and $mnt_pnt are the same by coincidence.
+my $mntpnt        = "/opt/mvparchive";
+
+# Configuration file.
+my $cfg = "/etc/opt/mvp/syspar.d/defaults.res";
+
+# Name of machine that is running the script.
+my $this_host = hostname;
+defined $this_host or err( "Environment variable HOST was not defined." );
+
+# Error messages as defined in "man rsync"
+
+%rsync_err = ( 0, "Success",
+               1, "Syntax or usage error",
+               2, "Protocol incompatibility",
+               3, "Errors selecting input/output files, dirs",
+               4, "Requested action not supported: an attempt was made to manipulate 64-bit files on a platform that cannot support them; or an option wa\
+s specified that is supported by the client and not by the server.",
+               5, "Error starting client-server protocol",
+               10, "Error in socket I/O",
+               11, "Error in file I/O",
+               12, "Error in rsync protocol data stream",
+               13, "Errors with program diagnostics",
+               14, "Error in IPC code",
+               20, "Received SIGUSR1 or SIGINT",
+               21, "Some error returned by waitpid()",
+               22, "Error allocating core memory buffers",
+               23, "Partial transfer due to error",
+               24, "Partial transfer due to vanished source files",
+               30, "Timeout in data send/receive" );
+
+my $EXIT_SUCCESS = 0;
+my $EXIT_FAILURE = -1;
+
+sub msg
+{
+    my $msg = shift;
+    print "$msg\n";
+}
+
+sub msg_nobrk
+{
+    my $msg = shift;
+    print "$msg";
+}
+
+sub msg_log
+{
+    my $msg = shift;
+    msg($msg);
+    dolog($msg);
+}
+
+sub err
+{
+    my $msg = shift;
+    $msg = "[ERROR] ".$msg;
+    msg($msg);
+    dolog($msg);
+    exit $EXIT_FAILURE;
+}
+
+sub dolog
+{
+    my $msg = shift;
+    ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+    my $t =  sprintf "%4d-%02d-%02d %02d:%02d:%02d", $year+1900,$mon+1,$mday,$hour,$min,$sec;
+
+    my $perms = 0777;
+
+    if ( ! open LOG, ">>$logfile" ) {
+	msg("Couldn't open logfile. Error was \"$!\".");
+	exit $EXIT_FAILURE;
+    }
+
+    print LOG "$t  $msg\n";
+    close LOG;
+
+    # We may have just created the file so set permissions.
+    if ( ! chmod $perms, $logfile ) {
+	msg("Failed setting permissions for \"$logfile\". Error was \"$!\".");
+    }
+
+    return 1;
+}
+
+sub trim($)
+{
+    my $string = shift;
+    chomp($string);
+    $string =~ s/^\s+//;
+    $string =~ s/\s+$//;
+    return $string;
+}
+
+sub reload_nfs
+{
+    my $cmd = "/sbin/service nfs reload";
+    my $sys_out = system($cmd);
+    $sys_out == 0 or err("Failed reloading nfs service.");
+}
+
+sub rmkdir
+{
+    my($tpath) = @_;
+    my($dir, $accum);
+    my $ret = 1;
+
+    foreach $dir (split(/\//, $tpath)){
+	$accum = "$accum$dir/";
+	if($dir ne ""){
+	    if(! -d "$accum"){
+		if ( ! mkdir $accum ) {
+		    msg("Failed making directory \"$accum\".");
+		    $ret = 0
+		}
+		else {
+		    my $perms = 0777;
+		    chmod $perms, $accum or err("Failed setting permissions for \"$accum\". Error was \"$!\".");
+		}
+	    }
+	}
+    }
+
+    return $ret;
+}
+
+sub delete_old_files
+{
+    my $dir = shift;
+    my $keep_days = shift; 
+    
+    # Open and close the directory
+    opendir DIR, $dir or err("Failed opening \"$dir\".");
+    my @files = readdir(DIR);
+    closedir DIR;
+    
+    foreach my $f (@files) {
+
+	next if $f =~ /^\./;
+	my $file = "$dir/$f";
+	($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks) = stat($file);
+	my $diff = time() - $mtime;
+	my $days = $diff / 60 / 60 / 24;
+       
+	-d $file && delete_old_files($file, $keep_days);
+	my $days_rounded = sprintf("%.3f", $days);
+
+	if (-d $file && ($mtime eq "" || $days > $keep_days)) {
+	    if ($simulate) {
+		print "[simulate on] unlinking directory $file [$days_rounded days old]\n";
+            }
+            else {
+                rmdir($file);
+            }
+	}
+	elsif (-f $file && ($mtime eq "" || $days > $keep_days)) {
+	    if ($simulate) {
+		print "[simulate on] unlinking $file [$days_rounded days old]\n";
+	    }
+	    else {
+		unlink($file);
+	    }
+	}
+    }
+}
+
+
+################################################################################
+# Read configuration file.
+################################################################################
+
+sub read_config
+{
+    ! -r $cfg && err("Couldn't find archive settings file \"$cfg\".");
+    open( IN, "$cfg" ) or err("Failed opening archive settings file \"$cfg\"");
+    
+    # key/vals hash from config file.
+    %cfghash = ();
+
+    my @keys = ( 'an_arc_host', 'an_enable_arc', 'an_bwlimit' );
+
+    while (<IN>) {
+	$line = trim($_);
+	substr($line,0,1) eq "#" && next;
+	@toks = split( ':', $line );
+	my $key = trim($toks[0]);
+	my $val = trim($toks[1]);
+	$key eq "" && err("Archive settings \"$cfg\" is corrupt.\nPlease apply Configuration->AutoNetworker again.");
+	$key = substr $key, index($key, '_') + 1; # Strip off *.Cfg... part including first '_'.
+	$cfghash{$key} = $val;
+    }
+    
+    foreach (@keys) {
+	$$_ = defined $cfghash{$_} ? $cfghash{$_} : err("\"$_\" was required in \"$cfg\", but was not found.");
+    }
+}
+
+sub get_pidfile
+{
+    my $type = shift;
+    return $piddir."/.mvparc-".$type.".pid";
+}
+
+sub ck_pid
+{
+    my $type = shift;
+    defined $type or return 0;
+    my $pidfile = get_pidfile($type);
+    -f $pidfile or return 0;
+    -r $pidfile or return 0;
+    open PIDFILE, "<$pidfile" or err( "pid file \"$pidfile\" exists but failed to open for reading." );
+    my $pid = <PIDFILE>;
+    close PIDFILE;
+
+    # Is there a process running with this pid?
+    if (kill 0, $pid) {
+	return 1;
+    }
+
+    return 0;
+}
+
+sub create_pidfile
+{
+    my $type = shift;
+    my $pidfile = get_pidfile($type);
+    open PIDFILE, ">$pidfile" or err( "pid file \"$pidfile\" failed to open for writing." );
+    print PIDFILE $$;
+    close PIDFILE;
+    my $perms = 0777;
+    chmod $perms, $pidfile or msg_log("Failed setting permissions for \"$pidfile\". Error was \"$!\".");
+    return 1;
+}
+
+sub ck_already_running
+{
+    my $type = shift;
+    ck_pid($type) && exit $EXIT_FAILURE;
+    create_pidfile($type);
+}
+
+sub ck_enabled()
+{
+    if ($an_enable_arc eq "False") { 
+	exit $EXIT_FAILURE;
+    }
+}
+
+sub prompt_yn
+{
+    my $prompt = shift;
+
+    if ($prompt eq "") {
+	msg("Prompt had no message in prompt_yn().");
+	return 0;
+    }
+
+    do {
+        msg_nobrk($prompt);
+        my $reply = <>;
+        $reply = trim($reply);
+
+        if ($reply eq "y" || $reply eq "Y") {
+            return 1;
+        }
+        elsif ($reply eq "n" || $reply eq "N") {
+	    return 0;
+        }
+
+        msg("Please enter 'y' or 'n'.");
+
+    } while (1);
+ 
+    return 0;
+}
+
+sub setup_cron
+{
+    my $type = shift;
+
+    if ( $type ne "image" &&
+         $type ne "error" &&
+	 $type ne "dbase" )
+    {
+	err("Cron entry type was not recognized.");
+    }
+
+    my $user = shift;
+    defined $user or err("No user provided in setup_cron().");
+    my $mvparc_opt = "";
+
+    switch ($type)  {
+	case "image" {
+	    $mvparc_opt = "save-image";
+	}
+	case "error" {
+	    $mvparc_opt = "save-error";
+	}
+	case "dbase" {
+            $mvparc_opt = "save-dbase";
+        }
+    }
+
+    my $cronfile = "/var/spool/cron/$user";
+    my $crontmp = "$cronfile.tmp";
+    open(FD_OUT, ">>$crontmp") or err("Failed opening \"$crontmp\" for writing.");
+    my $method = "Wrote";
+
+    if (-e $cronfile) {
+
+	-r $cronfile or err("Couldn't read \"$cronfile\".");
+	open(FD_IN, "<$cronfile") or err("Failed opening \"$cronfile\" for reading.");
+
+	# Is there already an entry?
+
+	my $grep = "grep \"$mvparc_opt\" $cronfile";
+	my @lines = `$grep`;
+	my $do_overwrite = 0;
+
+	if (@lines) {
+
+	    if ( prompt_yn("Delete existing cron entry for \"$mvparc_opt\" (y/n)? ") ) {
+		uninstall_cron( getlogin(), $mvparc_opt );
+		return 1;
+	    }
+
+	    $do_overwrite = prompt_yn("Write over existing cron entry (y/n)? ");
+
+	    if (!$do_overwrite) {
+		unlink($crontmp);
+		return 1;
+	    }
+	} 
+
+	while (<FD_IN>) {
+	    
+	    if ($do_overwrite && $_ =~ /$mvparc_opt/) {
+		$method = "Overwrote";
+		next;
+	    }
+	    print FD_OUT $_;
+	}
+    }
+    
+    print "Minute (0-59, default = */10): ";
+    my $min = <>;
+    $min = trim($min);
+    $min eq "" and $min = "*/10";
+
+    print "Hour (0-23, default = *): ";
+    my $hour = <>;
+    $hour = trim($hour);
+    $hour eq "" and $hour = "*";
+
+    print "Day of Month (1-31, default = *)): ";
+    my $daym = <>;
+    $daym = trim($daym);
+    $daym eq "" and $daym = "*";
+
+    print "Month (1-12 OR jan,feb,mar,apr ..., default = *): ";
+    my $month = <>;
+    $month = trim($month);
+    $month eq "" and $month = "*";
+
+    print "Day of Week (0-6 OR sun,mon,... default = *) (Sunday = 0 or 7)";
+    my $dayw = <>;
+    $dayw = trim($dayw);
+    $dayw eq "" and $dayw = "*";
+
+    my $cronent = "$min $hour $daym $month $dayw /opt/mvp/script/mvparc --".$mvparc_opt." > /dev/null 2>&1";
+    print FD_OUT $cronent."\n";
+    rename($crontmp, $cronfile) or err("Failed renaming \"$crontmp\" to \"$cronfile\".");
+    msg("$method crontab entry to $cronfile:\n$cronent");
+    return 1;
+}
+
+sub setup_delete_cron
+{
+    my $user = shift;
+ 
+    if ($user eq "") {
+	msg("The username was not found in setup_delete_cron().");
+	return 0;
+    }
+
+    my $cronfile = "/var/spool/cron/$user";
+    my $crontmp = "$cronfile.tmp";
+    open(FD_OUT, ">>$crontmp") or err("Failed opening \"$crontmp\" for writing.");
+    my $method = "Wrote";
+    
+    if (-e $cronfile) {
+	
+        -r $cronfile or err("Couldn't read \"$cronfile\".");
+        open(FD_IN, "<$cronfile") or err("Failed opening \"$cronfile\" for reading.");
+	
+        # Is there already an entry?
+	
+        my $grep = "grep \"delete\" $cronfile";
+        my @lines = `$grep`;
+        my $do_overwrite = 0;
+	
+        if (@lines) {
+
+	    if ( prompt_yn("Delete existing cron entry for \"delete\" (y/n)? ") ) {
+		uninstall_cron( getlogin(), "delete" );
+		return 1;
+	    }
+	    else {
+		$do_overwrite = prompt_yn("Overwrite existing cron entry for \"delete\" (y/n)? ");
+	    }
+
+	    if (!$do_overwrite) {
+		unlink($crontmp);
+		return 0;
+	    }
+	}
+
+	while (<FD_IN>) {
+            if ($do_overwrite && $_ =~ /delete/) {
+                $method = "Overwrote";
+                next;
+            }
+            print FD_OUT $_;
+        }
+    }
+
+    my $days;
+
+  loopstart:
+    
+    print "How many days to keep files before permanent deletion? ";
+    my $days = <>;
+    $days = trim($days);
+
+    if ( $days < 1 || ! $days =~ /^[1-9]+$/ ) {
+	msg("Must be a positive integer.");
+	goto loopstart;
+    }
+
+    my $cronent = "0 0 * * * /opt/mvp/script/mvparc --delete -d $days --nosim > /dev/null 2>&1";
+    print FD_OUT $cronent."\n";
+    rename($crontmp, $cronfile) or err("Failed renaming \"$crontmp\" to \"$cronfile\".");
+    msg("$method crontab entry to $cronfile:\n$cronent");
+    return 1;
+}
+
+sub uninstall_cron
+{
+    my $user = shift;
+    my $search = shift;
+
+    if ($user eq "") {
+	msg("User was empty in uninstall_cron().");
+	return 0;
+    }
+
+    if ($search eq "") {
+	msg("Search term was empty in uninstall_cron().");
+	return 0;
+    }
+
+    my $cronfile = "/var/spool/cron/$user";
+    my $crontmp = "$cronfile.tmp";
+
+    -r $cronfile or err("Couldn't read \"$cronfile\".");
+
+    open(FD_OUT, ">>$crontmp") or err("Failed opening \"$crontmp\" for writing.");
+    open(FD_IN, "<$cronfile") or err("Failed opening \"$cronfile\" for reading.");
+
+    my $grep = "grep \"$search\" $cronfile";
+    my @lines = `$grep`;
+    
+    if (@lines) {
+
+	while (<FD_IN>) {
+	
+	    if ($_ =~ /$search/) {
+		next;
+	    }
+
+	    print FD_OUT $_;
+	}
+	
+	rename($crontmp, $cronfile) or err("Failed renaming \"$crontmp\" to \"$cronfile\".");
+	return 1;
+    }
+
+    return 0;
+}
+
+# check rsync daemon, try and start it if needed.
+sub ck_daemon
+{
+    print "Starting rsync daemon.\n";
+    my $cmd = "rsync --daemon";
+    my $sysret = system($cmd);
+    return 1;
+}
+ 
+sub ck_remote_host
+{
+    my $remote_host = $an_arc_host;
+    defined $remote_host or err( "A remote host must be specified." );
+    $p = Net::Ping->new();
+    $p->ping($remote_host) or err( "Cannot find remote host: ".$remote_host );
+}
+
+sub setup_exports
+{
+    my @export_dirs = ("/opt/mvp/image", "/opt/mvp/error", "/opt/mvp/dbase");
+
+    my $f = "/etc/exports";
+
+    foreach (@export_dirs) {
+
+	$xdir = $_;
+	@lines = `grep $xdir $f`;
+	
+	if (!@lines) {
+	    msg("Adding entry \"$xdir\" to \"$f\".");
+	    open( FD, ">>$f" ) or err("Failed opening \"$f\" for appending. Error was \"$!\".");
+	    print FD "$xdir\t*(rw,no_root_squash,async,insecure)\n";
+	}
+    }
+    
+    reload_nfs();
+    return 1;
+}
+
+sub setup_rsync_conf
+{
+    # Setup /etc/rsyncd.conf
+    
+    my $rsyncd_conf_hdr = "# BEGIN header
+uid = maint
+gid = pcb
+max connections = 30
+read only = no
+list = no
+incoming chmod = a+rwx
+# END header
+
+# BEGIN error
+# This is a common place for saving error files for use by an AutoGuide.
+[mvp.error]
+path=/opt/mvp
+# END error
+
+# BEGIN dbase
+# This is a common place for saving dbase files.
+[mvp.dbase]
+path=/opt/mvp/dbase
+# END dbase
+
+# BEGIN image
+# This is a common place for saving image files.
+[mvp.image]
+path=/opt/mvp
+# END image
+
+";
+    
+    my $f = "/etc/rsyncd.conf";
+    
+    if ( ! -f $f ) {
+	msg("Creating \"$f\"...");
+	open( FD, ">$f" ) or err("Failed opening \"$f\" for writing.  Must be superuser!");
+	print FD $rsyncd_conf_hdr;
+	close FD;
+    }
+
+    return 1;
+}
+
+sub setup_arc_tree
+{
+    my @dirs = ("/opt/mvp/error","/opt/mvp/elog","/opt/mvp/dbase","/opt/mvp/image");
+
+    foreach (@dirs) {
+
+	msg("Making directory \"$_\".");
+
+	if (!rmkdir($_)) {
+	    err("Failed making directory \"$_\". Error was \"$!\".");
+	}
+    }
+
+    return 1;
+}
+
+################################################################################
+#
+# A U T O I N S P E C T O R
+#
+################################################################################
+
+sub ai_image
+{
+    read_config();
+    msg("Image archive setup (AutoInspector).");
+    setup_cron( "image", getlogin() ) or err("Failed setting up the image archive crontab.");
+    msg("Image archiving setup was successful.");
+    exit $EXIT_SUCCESS;
+}
+
+sub ai_error
+{
+    read_config();
+    msg("Error archive setup (AutoInspector).");
+    setup_cron( "error", getlogin() ) or err("Failed setting up the error archive crontab.");
+    msg("Error archiving setup was successful.");
+    exit $EXIT_SUCCESS;
+}
+
+sub ai_dbase
+{
+    read_config();
+    msg("Recipe archive setup (AutoInspector).");
+    setup_cron( "dbase", getlogin() ) or err("Failed setting up the recipe archive crontab.");
+    msg("Recipe archiving setup was successful.");
+    exit $EXIT_SUCCESS;
+}
+
+
+################################################################################
+#
+# A U T O T R A I N E R
+#
+################################################################################
+
+sub at_image
+{
+    read_config();
+    msg("Image archive setup (AutoTrainer).");
+
+    defined $image_arc_client_host or err("The server name was not defined.");
+    defined $image_arc_dir or err("The remote archive directory was not defined.");
+    defined $mntpnt or err("The local mount point was not defined.");
+
+    if (! -d $mntpnt ) {
+	msg("Mount point directory \"$mntpnt\" does not exist. Creating...");
+	mkdir($mntpnt) or err("Failed creating directory \"$mntpnt\". Error was \"$!\".");
+	msg("Mount point directory \"$mntpnt\" was created.");
+    }
+    
+    msg("Mounting remote archive \"$image_arc_client_host:$image_arc_dir\" at \"$mntpnt\".");
+    my $syscmd = "mount $image_arc_client_host:$image_arc_dir $mntpnt";
+    my $sysret = system("mount $image_arc_client_host:$image_arc_dir $mntpnt");
+
+    $sysret != 0 && err("System command failed.");
+    msg("The remote directory \"$image_arc_client_host:$image_arc_dir\" is now mounted at \"$mntpnt\".");
+    msg("Image archive client was setup successfully.");
+    exit $EXIT_SUCCESS;
+}
+
+################################################################################
+#
+# S A V E  (images files)
+#
+################################################################################
+
+sub save_image
+{
+    ck_already_running("image");
+    read_config();
+    ck_enabled();
+    ck_remote_host(); # exits on fail...
+    my $remote_host = $an_arc_host;
+
+    my $img_dir = "/opt/mvp/image";
+    -r $img_dir or err( "The directory \"".$img_dir."\" was not found or is not readable." );
+    my $remote_dir = $remote_host."::mvp.image";
+    $rsync_cmd = "rsync --bwlimit=".$an_bwlimit." -aruz ".$img_dir." ".$remote_dir;
+
+    $debug && print $rsync_cmd."\n";
+    $sys_out = system($rsync_cmd);
+    $sys_out == 0 or err( "rsync error. Returned code: ".$sys_out." ( ".$rsync_err{$sys_out}." )" );
+    msg("Save complete.");
+    exit $EXIT_SUCCESS;
+}
+
+################################################################################
+#
+# S A V E  (error files)
+#
+################################################################################
+
+sub save_error
+{
+    ck_already_running("error");
+    read_config();
+    ck_enabled();
+    ck_remote_host(); # exits on fail...
+    my $remote_host = $an_arc_host;
+
+    my $error_dir = "/opt/mvp/error";
+    -r $error_dir or err( "The directory \"".$error_dir."\" was not found or is not readable." );
+    my $remote_dir = $remote_host."::mvp.error"; # mvp.error is actually an rsync.conf module name.
+    $rsync_cmd = "rsync --bwlimit=".$an_bwlimit." -aru ".$error_dir." ".$remote_dir;
+    
+    $debug && print $rsync_cmd."\n";
+    $sys_out = system($rsync_cmd);
+    $sys_out == 0 or err( "rsync error. Returned code: ".$sys_out." ( ".$rsync_err{$sys_out}." )" );
+    msg("Save complete.");
+    exit $EXIT_SUCCESS;
+}
+
+################################################################################
+#
+# S A V E  (dbase files)
+#
+################################################################################
+
+sub save_dbase
+{
+    ck_already_running("dbase");
+    read_config();
+    ck_enabled();
+    ck_remote_host(); # exits on fail...
+    
+    # First, copy all databases (.es) from $pcb/dbase to $pcb/.dbase
+    # They are to be renamed /opt/mvp/.dbase/recipe.<md5 hash of file>.es
+    # We then rsync this directory to the remote server.
+
+    my $dbdir = "$pcb/dbase";
+    -d $dbdir or err("Failed finding dbase directory \"$dbdir\"..");
+    -r $dbdir or err("\"$dbdir\" is not readable.");
+    
+    my $copy = "$pcb/.dbase"; # hidden directory.
+    -d $copy or mkdir($copy) or err("Failed mkdir \"$copy\". Error was \"$!\".");
+    my $perms = 0777;
+    chmod $perms, $copy or msg_log("Failed setting permissions for \"$copy\". Error was \"$!\".");
+
+    opendir(DIR, $dbdir);
+    
+    while ( $f = readdir(DIR) ) {
+
+	my $first = substr($f,0,1);
+	if ($first eq ".") {
+	    next;
+	}
+
+	$last_dot = rindex($f, ".es");
+	if ($last_dot < 0) {
+	    next;
+	}
+
+	my $fname = "$pcb/dbase/$f";
+	$f = substr($f, 0, $last_dot);
+	
+	open INPUT, "<$fname" or err("Failed opening \"$fname\" for reading");
+	undef $/;
+	my $data = <INPUT>;
+	close INPUT;
+	$/ = "\n";     # Restore for normal behaviour later in script
+	my $digest = md5_hex($data);
+
+#	my $newfname = "$pcb/.dbase/$f.$digest.es";
+	my $newfname = "$pcb/.dbase/$f.es";
+#	-e $newfname or copy($fname, $newfname) or err("Failed copying \"$fname\" to \"$newfname\". Error was \"$!\".");
+	$rsync_cmd = "rsync -aru /opt/mvp/dbase/*.es /opt/mvp/.dbase/";
+	
+        $sys_out = system($rsync_cmd);
+        $sys_out == 0 or err( "rsync error. Returned code: ".$sys_out." ( ".$rsync_err{$sys_out}." )" );
+    }
+
+    closedir(DIR);
+
+    # Now, rsync /opt/mvp/.dbase to /opt/mvp/dbase on remote host.
+
+    my $remote_host = $an_arc_host;
+    my $remote_dir = $remote_host."::mvp.dbase";
+#    $rsync_cmd = "rsync --bwlimit=".$an_bwlimit." -rt ".$copy."/* ".$remote_dir;
+    $rsync_cmd = "rsync --bwlimit=".$an_bwlimit." -aru /opt/mvp/dbase/*.es ".$remote_dir;
+
+    $debug && print $rsync_cmd."\n";
+    $sys_out = system($rsync_cmd);
+    $sys_out == 0 or err( "rsync error. Returned code: ".$sys_out." ( ".$rsync_err{$sys_out}." )" );
+    msg("Recipe file save complete.");
+    exit $EXIT_SUCCESS;
+}
+
+sub make_index
+{
+    my $idir = "/opt/mvp/image";
+    -d $idir or err("Failed making image index because \"$idir\" was not found.");
+#    my $cmd = "find 
+
+
+}
+
+# Main
+
+my $ret = $EXIT_FAILURE;
+
+if ($arg eq "--ai") {
+    $ret = ai_image()
+	&& ai_error();
+}
+elsif ($arg eq "--ai-image") {
+    $ret = ai_image();
+}
+elsif ($arg eq "--ai-error") {
+    $ret = ai_error();
+}
+elsif ($arg eq "--ai-dbase") {
+    $ret = ai_dbase();
+}
+elsif ($arg eq "--at-image") {
+    $ret = at_image();
+}
+elsif ($arg eq "--save-image") {
+    $ret = save_image();
+}
+elsif ($arg eq "--save-error") {
+    $ret = save_error();
+}
+elsif ($arg eq "--save-dbase") {
+    $ret = save_dbase();
+}
+elsif ($arg eq "--save-all") {
+
+    $ret = save_dbase()
+	&& save_image()
+	&& save_error();
+}
+elsif ($arg eq "--server") {
+
+    msg("MVP Archive Server Setup.");
+
+    $ret = setup_arc_tree()
+	&& setup_exports()
+	&& setup_rsync_conf()
+	&& setup_delete_cron(getlogin());
+}
+elsif ($arg eq "--delete-setup") {
+    $ret = setup_delete_cron(getlogin());
+}
+elsif ($arg eq "--make-index") {
+    $ret = make_index();
+}
+elsif ($arg eq "--delete") {
+
+    my $next_arg = shift;
+    $next_arg ne "-d" && err("--delete option needs a -d too!");
+    $keep_days = shift;
+    defined $keep_days || err("-d needs an integer (days to keep).");
+    $next_arg = shift;
+
+    if ($next_arg eq "--nosim") {
+	$simulate = 0;
+    }
+
+    $ret = delete_old_files("/opt/mvp/error", $keep_days)
+      || delete_old_files("/opt/mvp/image", $keep_days)
+      || delete_old_files("/opt/mvp/stats", $keep_days);
+}
+else {
+
+    msg("Unknown argument \"$arg\".");
+    usage();
+}
+
+exit $ret;
